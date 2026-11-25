@@ -7,6 +7,7 @@
 
 export const META_STORAGE_KEY = 'PocketRadioMeta_v1';
 export const PLAYBACK_STORAGE_KEY = 'PocketRadioPlayback_v1';
+export const CURRENT_SCHEMA_VERSION = 2;
 
 // 再生速度の切り替えステップ
 export const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
@@ -35,7 +36,7 @@ function getStorage() {
  */
 export function createDefaultMeta() {
   return {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     episodes: {},
     programs: {
       Harusanchi: {
@@ -43,6 +44,12 @@ export function createDefaultMeta() {
         name: '井上春華のはるさんち',
         color: '#34d399',
         order: 1,
+      },
+      'Dominant-Life': {
+        key: 'Dominant-Life',
+        name: '佐藤優樹のDominant Life!',
+        color: '#2dd4bf',
+        order: 2,
       },
       _other: {
         key: '_other',
@@ -66,18 +73,40 @@ export function createDefaultMeta() {
 
 /**
  * 読み込んだデータに不足している項目があれば、初期値で安全に補う
+ * applyMigrations=true のときは、古いバージョン(v1)からの自動移行も1回だけ行う
  * @param {any} raw
+ * @param {{ applyMigrations?: boolean }} options
  */
-function normalizeMeta(raw) {
+function normalizeMeta(raw, { applyMigrations = false } = {}) {
   const defaults = createDefaultMeta();
   if (!raw || typeof raw !== 'object') {
     return defaults;
   }
 
+  const rawVersion = Number(raw.schemaVersion) || 1;
   const programs =
     raw.programs && typeof raw.programs === 'object'
       ? { ...raw.programs }
       : { ...defaults.programs };
+
+  const episodes =
+    raw.episodes && typeof raw.episodes === 'object' ? { ...raw.episodes } : {};
+
+  // v1 -> v2 自動移行：すでにアプリを起動済みの環境へ「佐藤優樹のDominant Life!」を1回だけ追加する
+  if (applyMigrations && rawVersion < 2) {
+    const hasDominantLife = Object.keys(programs).some(
+      (k) => k.toLowerCase() === 'dominant-life'
+    );
+    if (!hasDominantLife) {
+      programs['Dominant-Life'] = { ...defaults.programs['Dominant-Life'] };
+    }
+
+    for (const ep of Object.values(episodes)) {
+      if (ep && typeof ep.programKey === 'string' && ep.programKey.toLowerCase() === 'dominant-life') {
+        ep.programKey = 'Dominant-Life';
+      }
+    }
+  }
 
   // 「その他」グループは削除されても必ず存在するように保証する
   if (!programs._other) {
@@ -85,8 +114,8 @@ function normalizeMeta(raw) {
   }
 
   return {
-    schemaVersion: 1,
-    episodes: raw.episodes && typeof raw.episodes === 'object' ? { ...raw.episodes } : {},
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    episodes,
     programs,
     memos: Array.isArray(raw.memos) ? raw.memos : [],
     completedHistory: Array.isArray(raw.completedHistory) ? raw.completedHistory : [],
@@ -107,7 +136,14 @@ export function loadMeta() {
       return createDefaultMeta();
     }
     const parsed = JSON.parse(json);
-    return normalizeMeta(parsed);
+    const rawVersion = Number(parsed?.schemaVersion) || 1;
+    const normalized = normalizeMeta(parsed, { applyMigrations: true });
+
+    // 古いバージョンからの移行が行われた場合は、結果を保存して次回以降勝手に再追加されないようにする
+    if (rawVersion < CURRENT_SCHEMA_VERSION) {
+      saveMeta(normalized);
+    }
+    return normalized;
   } catch (error) {
     console.warn('メタデータの読み込みに失敗したため初期値を使用します:', error);
     return createDefaultMeta();
@@ -856,7 +892,7 @@ export function markEpisodesAudioDeleted(meta, fileNames) {
 export function createBackupPayload(meta) {
   return {
     app: 'Pocket Radio',
-    schemaVersion: 1,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
     data: {
       programs: meta.programs || {},
@@ -888,7 +924,7 @@ export function parseAndValidateBackup(jsonText) {
   if (parsed.app === 'Pocket Radio' && parsed.data && typeof parsed.data === 'object') {
     rawData = parsed.data;
   } else if (
-    parsed.schemaVersion === 1 &&
+    Number(parsed.schemaVersion) >= 1 &&
     parsed.episodes &&
     typeof parsed.episodes === 'object'
   ) {
@@ -898,7 +934,7 @@ export function parseAndValidateBackup(jsonText) {
     return { ok: false, error: 'Pocket Radio のバックアップファイルではありません' };
   }
 
-  const normalized = normalizeMeta(rawData);
+  const normalized = normalizeMeta(rawData, { applyMigrations: false });
   const summary = {
     programCount: Object.keys(normalized.programs).filter((k) => k !== '_other').length,
     episodeCount: Object.keys(normalized.episodes).length,
@@ -921,7 +957,7 @@ export function parseAndValidateBackup(jsonText) {
  * @param {'merge' | 'replace'} mode
  */
 export function applyBackupData(meta, backupData, mode = 'merge') {
-  const safeBackup = normalizeMeta(backupData);
+  const safeBackup = normalizeMeta(backupData, { applyMigrations: false });
 
   if (mode === 'replace') {
     const replacedEpisodes = {};
@@ -934,7 +970,7 @@ export function applyBackupData(meta, backupData, mode = 'merge') {
       };
     }
 
-    meta.schemaVersion = 1;
+    meta.schemaVersion = CURRENT_SCHEMA_VERSION;
     meta.programs = safeBackup.programs;
     meta.episodes = replacedEpisodes;
     meta.memos = safeBackup.memos;
